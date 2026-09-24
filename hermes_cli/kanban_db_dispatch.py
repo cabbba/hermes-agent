@@ -1929,6 +1929,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_by_profile: Optional[dict[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -1952,6 +1953,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_by_profile=max_in_progress_by_profile,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -2001,6 +2003,7 @@ def _dispatch_lane_task(
     failure_limit: int,
     spawn_fn,
     per_profile_cap: Optional[int],
+    per_profile_caps: Optional[dict[str, int]],
     per_profile_running: dict[str, int],
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
@@ -2018,9 +2021,10 @@ def _dispatch_lane_task(
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
-    if per_profile_cap is not None:
+    profile_cap = (per_profile_caps or {}).get(assignee, per_profile_cap)
+    if profile_cap is not None:
         current = per_profile_running.get(assignee, 0)
-        if current >= per_profile_cap:
+        if current >= profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
@@ -2041,7 +2045,7 @@ def _dispatch_lane_task(
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
-        if per_profile_cap is not None and name:
+        if ((per_profile_caps or {}).get(name, per_profile_cap) is not None) and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
     if dry_run:
@@ -2233,6 +2237,7 @@ def _any_spawnable_review(
     review_rows: list[sqlite3.Row],
     *,
     per_profile_cap: Optional[int] = None,
+    per_profile_caps: Optional[dict[str, int]] = None,
     per_profile_running: Optional[dict[str, int]] = None,
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
@@ -2253,7 +2258,8 @@ def _any_spawnable_review(
             continue
         if profile_exists is not None and not profile_exists(assignee):
             continue
-        if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
+        profile_cap = (per_profile_caps or {}).get(assignee, per_profile_cap)
+        if profile_cap is not None and running.get(assignee, 0) >= profile_cap:
             continue
         if check_respawn_guard(conn, row["id"], lane="review") is None:
             return True
@@ -2291,6 +2297,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_by_profile: Optional[dict[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -2325,8 +2332,18 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
+    per_profile_caps: dict[str, int] = {}
+    if isinstance(max_in_progress_by_profile, dict):
+        for raw_assignee, raw_cap in max_in_progress_by_profile.items():
+            assignee = str(raw_assignee).strip()
+            try:
+                cap = int(raw_cap)
+            except (TypeError, ValueError):
+                continue
+            if assignee and cap > 0:
+                per_profile_caps[assignee] = cap
     per_profile_running: dict[str, int] = {}
-    if per_profile_cap is not None:
+    if per_profile_cap is not None or per_profile_caps:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
@@ -2340,13 +2357,15 @@ def _dispatch_once_locked(
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
-        per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        per_profile_cap=per_profile_cap, per_profile_caps=per_profile_caps,
+        per_profile_running=per_profile_running,
     ):
         ready_budget = max(spawn_budget - 1, 0)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
-        per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        per_profile_cap=per_profile_cap, per_profile_caps=per_profile_caps,
+        per_profile_running=per_profile_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

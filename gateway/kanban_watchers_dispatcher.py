@@ -42,6 +42,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    max_in_progress_by_profile: dict[str, int]
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -102,6 +103,22 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
+    raw_by_profile = kanban_cfg.get("max_in_progress_by_profile", {})
+    max_in_progress_by_profile: dict[str, int] = {}
+    if raw_by_profile is not None and not isinstance(raw_by_profile, dict):
+        logger.warning("kanban dispatcher: kanban.max_in_progress_by_profile must be a mapping; ignoring %r", raw_by_profile)
+    elif isinstance(raw_by_profile, dict):
+        for raw_assignee, raw_cap in raw_by_profile.items():
+            assignee = str(raw_assignee).strip()
+            try:
+                cap = int(raw_cap)
+            except (TypeError, ValueError):
+                cap = 0
+            if assignee and cap > 0:
+                max_in_progress_by_profile[assignee] = cap
+            else:
+                logger.warning("kanban dispatcher: invalid cap for profile %r: %r; ignoring", raw_assignee, raw_cap)
+
     return _DispatcherSettings(
         interval=interval,
         max_spawn=max_spawn,
@@ -115,6 +132,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        max_in_progress_by_profile=max_in_progress_by_profile,
     )
 
 

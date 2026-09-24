@@ -104,3 +104,75 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert res2.spawned[0][0] != spawned_id  # different task this time
 
 
+def test_profile_cap_map_applies_to_ready_lane(isolated_kanban_home_with_profiles):
+    """A named cap limits ready-lane work for only that assignee."""
+    kb = isolated_kanban_home_with_profiles
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        for i in range(2):
+            kb.create_task(conn, title=f"ready-{i}", assignee="alpha")
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True,
+            max_in_progress_by_profile={"alpha": 1},
+        )
+
+    assert len(res.spawned) == 1
+    assert res.spawned[0][1] == "alpha"
+    assert len(res.skipped_per_profile_capped) == 1
+    assert res.skipped_per_profile_capped[0][1:] == ("alpha", 1)
+
+
+def test_profile_cap_map_applies_to_review_lane(isolated_kanban_home_with_profiles):
+    """A named cap also limits review-lane work."""
+    kb = isolated_kanban_home_with_profiles
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        for i in range(2):
+            task_id = kb.create_task(
+                conn, title=f"review-{i}", assignee="alpha",
+            )
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True,
+            max_in_progress_by_profile={"alpha": 1},
+        )
+
+    assert len(res.spawned) == 1
+    assert res.spawned[0][1] == "alpha"
+    assert len(res.skipped_per_profile_capped) == 1
+    assert res.skipped_per_profile_capped[0][1] == "alpha"
+
+
+def test_profile_cap_map_uses_scalar_fallback_for_unmapped_profiles(
+    isolated_kanban_home_with_profiles,
+):
+    """An unmapped profile retains the legacy scalar cap."""
+    kb = isolated_kanban_home_with_profiles
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        for i in range(3):
+            kb.create_task(conn, title=f"beta-{i}", assignee="beta")
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True,
+            max_in_progress_per_profile=2,
+            max_in_progress_by_profile={"alpha": 1},
+        )
+
+    assert len([row for row in res.spawned if row[1] == "beta"]) == 2
+    assert [row[1] for row in res.skipped_per_profile_capped] == ["beta"]
